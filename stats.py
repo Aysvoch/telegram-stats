@@ -55,9 +55,11 @@ FMT_KPI_V  = mk(CARD_BG,  bold=True, size=22, fg=GREEN_VAL, h="CENTER", v="TOP")
 FMT_MANUAL = mk(Color(1.0, 0.992, 0.929), size=9)
 
 def get_book():
+    import json
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
                "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 
 def get_or_create(book, title):
@@ -314,8 +316,11 @@ def write_channel(ws, book, ch, subs, desc):
     set_frozen(ws,rows=1)
 
 async def main():
-    async with TelegramClient("session",API_ID,API_HASH) as tg:
-        await tg.start(phone=PHONE)
+    from telethon.sessions import StringSession
+    SESSION = os.getenv("SESSION_STRING")
+
+    async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as tg:
+        
         full=await tg(GetFullChannelRequest(CHANNEL))
         ch=full.chats[0]; subs=full.full_chat.participants_count
         desc=full.full_chat.about or ""
