@@ -58,8 +58,15 @@ def get_book():
     import json
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
                "https://www.googleapis.com/auth/drive"]
-    creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+    creds_env = os.getenv("GOOGLE_CREDENTIALS")
+    if creds_env:
+        # Облако (GitHub Actions): ключ в переменной окружения
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_env), scopes=scopes)
+    else:
+        # Локальный запуск: ключ в файле рядом со скриптом
+        creds = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 
 def get_or_create(book, title):
@@ -156,18 +163,35 @@ def write_posts(ws, book, posts, subscribers):
     ws.clear(); time.sleep(1)
 
     header = ["ID","Дата","Ссылка","Превью текста","Просм. сейчас",
-              "Просм. 24ч ✏️","Просм. 72ч ✏️","Реакции (всего)",
+              "Просм. 24ч","Просм. 72ч","Реакции (всего)",
               "Реакции (детально)","Подписчики","1-Day Reach %","ER поста %","Комментарий ✏️"]
 
     rows = [header]
+    now = datetime.now(timezone.utc)
     for p in posts:
         ex = existing_map.get(p["id"], {})
         subs_val = ex.get("subs") or subscribers
+
+        # Возраст поста в часах (дата в таблице хранится в UTC)
+        post_dt = datetime.strptime(p["date"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        age_h = (now - post_dt).total_seconds() / 3600
+
+        # Автозаполнение: пишем текущие просмотры, если ячейка ещё пустая
+        # и пост находится в нужном временном окне.
+        # Уже заполненные (в т.ч. вручную) значения никогда не перезаписываем.
+        views_24h = ex.get("views_24h", "")
+        if not views_24h and 24 <= age_h < 48:
+            views_24h = p["views"]
+
+        views_72h = ex.get("views_72h", "")
+        if not views_72h and 72 <= age_h < 96:
+            views_72h = p["views"]
+
         rows.append([
             p["id"], p["date"], post_url(p["id"]), p["text_preview"],
             p["views"],
-            ex.get("views_24h", ""),
-            ex.get("views_72h", ""),
+            views_24h,
+            views_72h,
             p["reactions_total"], p["reactions_fmt"],
             subs_val, "", "", ex.get("comment", ""),
         ])
@@ -208,8 +232,8 @@ def write_posts(ws, book, posts, subscribers):
         border(ws, f"A1:M{last}"),
         hide_cols(ws, 13, 20),
         hide_rows(ws, last, 500),
-        note_req(ws,"F1","Вводи вручную: просмотры через 24 часа после публикации"),
-        note_req(ws,"G1","Вводи вручную: просмотры через 72 часа после публикации"),
+        note_req(ws,"F1","Заполняется автоматически через ~24 часа после публикации. Можно ввести вручную - скрипт не перезапишет."),
+        note_req(ws,"G1","Заполняется автоматически через ~72 часа после публикации. Можно ввести вручную - скрипт не перезапишет."),
         note_req(ws,"M1","Вводи вручную: заметки и наблюдения по посту"),
     ]
     push(book, reqs)
@@ -320,7 +344,7 @@ async def main():
     SESSION = os.getenv("SESSION_STRING")
 
     async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as tg:
-        
+
         full=await tg(GetFullChannelRequest(CHANNEL))
         ch=full.chats[0]; subs=full.full_chat.participants_count
         desc=full.full_chat.about or ""
