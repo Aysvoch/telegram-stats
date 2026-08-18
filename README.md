@@ -102,4 +102,4 @@ Python (Telethon, gspread, gspread-formatting) · Google Sheets API (серви�
 
 ## Автор
 
-Андрей — [@Private_ether](https://t.me/Private_ether)
+Андрей — [@Private_ether](https://t.me/Aysvoch)
