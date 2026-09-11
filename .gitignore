@@ -1,3 +1,15 @@
+# Секреты и переменные окружения
 .env
-telegramstats-500216-4fac021bdfc6.json
-session.session
+
+# Ключи сервисных аккаунтов Google.
+# Маской, а не именем файла: имя ключа раскрывает id проекта Google,
+# а .gitignore лежит в публичном репозитории.
+*.json
+
+# Сессия Telegram (Telethon)
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.pyc

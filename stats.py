@@ -17,6 +17,7 @@
 # ============================================================
 
 import os
+import glob
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
@@ -39,7 +40,8 @@ load_dotenv()
 # ---------- Секреты и константы ----------
 
 # Понятная ошибка вместо криптоватого TypeError, если .env не подхватился
-_missing = [k for k in ("API_ID", "API_HASH", "CHANNEL") if not os.getenv(k)]
+_missing = [k for k in ("API_ID", "API_HASH", "CHANNEL", "SPREADSHEET_ID")
+            if not os.getenv(k)]
 if _missing:
     raise SystemExit(
         f"Не найдены переменные окружения: {', '.join(_missing)}. "
@@ -49,8 +51,12 @@ API_ID   = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 CHANNEL  = os.getenv("CHANNEL")
 
-SERVICE_ACCOUNT_FILE = "telegramstats-500216-4fac021bdfc6.json"
-SPREADSHEET_ID       = "1qiJmZREHIxfEsr90zr-O34FEF-6YG3nwRuGSSaAyY3s"
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+# Имя json-ключа не зашито в код: репозиторий публичный, а само имя файла
+# раскрывало бы id проекта Google. Локально берём путь из переменной
+# SERVICE_ACCOUNT_FILE, а если её нет - ищем единственный json рядом со скриптом.
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
 
 # ---------- Палитра оформления ----------
 
@@ -87,10 +93,39 @@ FMT_MANUAL = mk(Color(1.0, 0.992, 0.929), size=9)  # жёлтый: ячейки,
 
 # ---------- Подключение к Google Sheets ----------
 
+def find_local_key():
+    """Путь к json-ключу Google для локального запуска.
+
+    Сначала смотрим переменную SERVICE_ACCOUNT_FILE. Если её нет - ищем
+    единственный json-файл в папке со скриптом (json-ы в git не попадают,
+    см. .gitignore). Несколько файлов или ни одного - понятная ошибка.
+    """
+    if SERVICE_ACCOUNT_FILE:
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            raise SystemExit(
+                f"Локальный запуск: не найден файл ключа {SERVICE_ACCOUNT_FILE}.")
+        return SERVICE_ACCOUNT_FILE
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    found = sorted(glob.glob(os.path.join(here, "*.json")))
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise SystemExit(
+            "Локальный запуск: json-ключ Google не найден в папке со скриптом. "
+            "Положи его рядом или укажи путь в переменной SERVICE_ACCOUNT_FILE.")
+    raise SystemExit(
+        "Локальный запуск: в папке несколько json-файлов. "
+        "Укажи нужный в переменной SERVICE_ACCOUNT_FILE (файл .env).")
+
 def get_book():
     """Открывает таблицу. Сам определяет режим:
     - есть переменная GOOGLE_CREDENTIALS -> облако (GitHub Actions)
     - нет -> локальный запуск, ключ читаем из json-файла рядом со скриптом
+
+    BackOffHTTPClient - встроенный в gspread клиент с экспоненциальными
+    повторами на 408, 429 и любых 5xx (включая 503 "сервис недоступен").
+    Без него один временный сбой на стороне Google ронял весь прогон.
     """
     import json
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
@@ -100,13 +135,10 @@ def get_book():
         creds = Credentials.from_service_account_info(
             json.loads(creds_env), scopes=scopes)
     else:
-        if not os.path.exists(SERVICE_ACCOUNT_FILE):
-            raise SystemExit(
-                f"Локальный запуск: не найден файл ключа {SERVICE_ACCOUNT_FILE}. "
-                "Скопируй его в папку со скриптом.")
         creds = Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+            find_local_key(), scopes=scopes)
+    client = gspread.authorize(creds, http_client=gspread.BackOffHTTPClient)
+    return client.open_by_key(SPREADSHEET_ID)
 
 # ---------- Мелкие помощники для Google Sheets API ----------
 

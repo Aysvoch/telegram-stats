@@ -2,22 +2,32 @@ name: Telegram Stats
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # Минута 19, а не 0: в начале часа у GitHub пик нагрузки на планировщик,
+    # запуски там стабильно опаздывают на 5-30 минут и иногда теряются.
+    - cron: '19 */6 * * *'
   workflow_dispatch:
 
 jobs:
   run-stats:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
+      # Версии зафиксированы: без пинов каждый прогон тянет последние релизы,
+      # и мажорное обновление может молча сломать рабочий скрипт.
       - name: Install dependencies
-        run: pip install telethon gspread gspread-formatting google-auth python-dotenv
+        run: |
+          pip install \
+            telethon==1.45.0 \
+            gspread==6.2.1 \
+            gspread-formatting==1.2.1 \
+            google-auth==2.58.0 \
+            python-dotenv==1.2.3
 
       - name: Run stats
         env:
@@ -26,4 +36,5 @@ jobs:
           CHANNEL: ${{ secrets.CHANNEL }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python stats.py
