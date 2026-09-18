@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from dotenv import load_dotenv
 from telethon import TelegramClient
@@ -262,9 +263,19 @@ def as_number(value, default=0):
         return default
 
 
+def round_half_up(value, digits=0):
+    """Округление как в Google Sheets ROUND, а не банковское round Python."""
+    quantum = Decimal("1").scaleb(-digits)
+    rounded = Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP)
+    return int(rounded) if digits == 0 else float(rounded)
+
+
 def engagement_rate(reactions, forwards, replies, views):
     """ERR: все измеряемые взаимодействия относительно просмотров."""
-    return round((reactions + forwards + replies) / views * 100, 1) if views else 0
+    if not views:
+        return 0
+    return round_half_up(
+        (reactions + forwards + replies) / views * 100, 1)
 
 
 def week_label(date_str):
@@ -298,7 +309,7 @@ def weekly_summary(posts):
         result.append([
             week_label(sample_date.strftime("%Y-%m-%d %H:%M")),
             count,
-            round(data["views"] / count) if count else 0,
+            round_half_up(data["views"] / count) if count else 0,
             engagement_rate(
                 data["reactions"], data["forwards"],
                 data["replies"], data["views"]),
@@ -369,10 +380,99 @@ def _analytics_post(row):
     }
 
 
+def telegram_message_to_post(message):
+    """Преобразует одно сообщение Telegram в запись аналитики."""
+    reactions_total = 0
+    reactions_detail = {}
+    if message.reactions:
+        for reaction in message.reactions.results:
+            emoji = (reaction.reaction.emoticon
+                     if hasattr(reaction.reaction, "emoticon")
+                     else type(reaction.reaction).__name__)
+            reactions_detail[emoji] = (
+                reactions_detail.get(emoji, 0) + reaction.count)
+            reactions_total += reaction.count
+
+    views = message.views or 0
+    forwards = message.forwards or 0
+    replies = message.replies.replies if message.replies else 0
+    return {
+        "id": message.id,
+        "date": message.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "text_preview": ((message.message or "[медиа без подписи]")[:80]
+                         .replace("\n", " ")),
+        "views": views,
+        "forwards": forwards,
+        "replies": replies,
+        "reactions_total": reactions_total,
+        "reactions_fmt": fmt_reactions(reactions_detail),
+        "err": engagement_rate(
+            reactions_total, forwards, replies, views),
+    }
+
+
+def collapse_telegram_messages(messages):
+    """Возвращает один логический пост на сообщение или медиальбом.
+
+    Telegram отдаёт каждый файл альбома как отдельное сообщение с общим
+    grouped_id. Для совместимости с накопленной историей представителем
+    альбома остаётся сообщение с подписью; если подписи нет, берётся первый
+    (с наименьшим ID). ID остальных частей сохраняются для удаления ранее
+    ошибочно созданных строк.
+    """
+    groups = defaultdict(list)
+    for message in messages:
+        if not message.message and not message.media:
+            continue
+        grouped_id = getattr(message, "grouped_id", None)
+        key = ("album", grouped_id) if grouped_id is not None else (
+            "message", message.id)
+        groups[key].append(message)
+
+    posts = []
+    for group in groups.values():
+        captioned = [message for message in group if message.message]
+        representative = min(captioned or group, key=lambda message: message.id)
+        post = telegram_message_to_post(representative)
+        post["component_ids"] = sorted(message.id for message in group)
+        posts.append(post)
+    return sorted(posts, key=lambda post: post["id"], reverse=True)
+
+
+def _merge_album_history(target, source):
+    """Переносит ручные/исторические поля из лишней строки медиальбома."""
+    for index in (5, 6, 9):
+        if target[index] in (None, "") and source[index] not in (None, ""):
+            target[index] = source[index]
+
+    source_comment = str(source[12] or "").strip()
+    target_comment = str(target[12] or "").strip()
+    if source_comment and source_comment != target_comment:
+        target[12] = (f"{target_comment}\n{source_comment}"
+                      if target_comment else source_comment)
+
+
 def build_post_rows(existing_values, posts, subscribers, channel, now=None):
     """Объединяет свежие данные с историей, не удаляя старые посты."""
     existing = _existing_posts(existing_values)
     fresh = {post["id"]: post for post in posts}
+    component_owner = {}
+    for post in posts:
+        for component_id in post.get("component_ids", [post["id"]]):
+            component_owner[int(component_id)] = post["id"]
+
+    # Удаляем строки частей альбомов, которые предыдущая версия ошибочно
+    # считала отдельными постами. Если туда успели внести ручные данные,
+    # переносим их в строку логического поста и ничего не теряем.
+    for component_id, owner_id in component_owner.items():
+        if component_id == owner_id:
+            continue
+        component_row = existing.pop(component_id, None)
+        if component_row is None:
+            continue
+        owner_row = existing.setdefault(owner_id, [""] * 16)
+        _merge_album_history(owner_row, component_row)
+
     now = now or datetime.now(timezone.utc)
     rows_by_id = {}
 
@@ -451,6 +551,12 @@ def write_posts(ws, book, posts, subscribers, channel):
             formula_updates[start:start + 500],
             value_input_option="USER_ENTERED")
 
+    # update() не очищает старый хвост листа. После успешной записи удаляем
+    # только строки, которые больше не принадлежат ни одному логическому посту
+    # (например, ошибочно созданные части медиальбомов).
+    if len(existing_values) > len(rows):
+        ws.batch_clear([f"A{len(rows) + 1}:P{len(existing_values)}"])
+
     set_column_widths(ws, [("A", 52), ("B", 130), ("C", 180), ("D", 270),
                            ("E", 100), ("F", 105), ("G", 105), ("H", 110),
                            ("I", 200), ("J", 105), ("K", 110), ("L", 130),
@@ -493,7 +599,7 @@ def write_dashboard(ws, book, posts, subs):
 
     # KPI-карточки: подписчики, постов всего, средние просмотры, взвешенный ERR
     n      = len(posts)
-    avg_v  = round(sum(p["views"] for p in posts)/n) if n else 0
+    avg_v  = round_half_up(sum(p["views"] for p in posts)/n) if n else 0
     total_views = sum(p["views"] for p in posts)
     avg_err = engagement_rate(
         sum(p["reactions_total"] for p in posts),
@@ -574,6 +680,55 @@ def write_dashboard(ws, book, posts, subs):
 #  ЛИСТ «ДИНАМИКА» + служебный слепок аудитории
 # ============================================================
 
+SHEETS_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
+DYNAMICS_DATE_PATTERN = "yyyy-mm-dd hh:mm"
+
+
+def sheets_datetime_serial(value):
+    """UTC datetime -> серийное число даты Google Sheets/Excel."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (value.astimezone(timezone.utc) - SHEETS_EPOCH).total_seconds() / 86400
+
+
+def dynamics_date_cell(value):
+    """Ячейка даты, которую Google хранит числом, а не текстом."""
+    return {
+        "userEnteredValue": {"numberValue": sheets_datetime_serial(value)},
+        "userEnteredFormat": {"numberFormat": {
+            "type": "DATE_TIME",
+            "pattern": DYNAMICS_DATE_PATTERN,
+        }},
+    }
+
+
+def dynamics_date_repair_requests(ws):
+    """Одноразово преобразует даты, записанные прежней версией как текст."""
+    values = ws.get("A2:A", value_render_option="UNFORMATTED_VALUE")
+    requests = []
+    for offset, row in enumerate(values):
+        raw_value = row[0] if row else ""
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        try:
+            parsed = datetime.strptime(
+                raw_value.strip(), "%Y-%m-%d %H:%M").replace(
+                    tzinfo=timezone.utc)
+        except ValueError:
+            # Не переписываем незнакомое пользовательское значение.
+            continue
+        requests.append({
+            "updateCells": {
+                # offset=0 соответствует строке 2, то есть rowIndex=1.
+                "start": {"sheetId": ws.id, "rowIndex": offset + 1,
+                          "columnIndex": 0},
+                "rows": [{"values": [dynamics_date_cell(parsed)]}],
+                "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+            }
+        })
+    return requests
+
+
 def write_dynamics(book, current_ids, subs):
     """История подписчиков.
 
@@ -623,7 +778,8 @@ def write_dynamics(book, current_ids, subs):
 
     # 3. Приток/отток. Первый снимок задаёт точку отсчёта.
     joined, left = calculate_audience_delta(old_ids, new_ids, initialized)
-    captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    captured_at_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    captured_at = captured_at_dt.strftime("%Y-%m-%d %H:%M")
 
     if aud.row_count < max(len(new_ids), 2):
         aud.resize(rows=max(len(new_ids) + 100, 2),
@@ -661,6 +817,7 @@ def write_dynamics(book, current_ids, subs):
                 "fields": "userEnteredValue",
             }
         })
+    requests.extend(dynamics_date_repair_requests(dyn))
     requests.extend([
         {
             "updateCells": {
@@ -674,12 +831,12 @@ def write_dynamics(book, current_ids, subs):
             "appendCells": {
                 "sheetId": dyn.id,
                 "rows": [{"values": [
-                    {"userEnteredValue": entered(captured_at)},
+                    dynamics_date_cell(captured_at_dt),
                     {"userEnteredValue": entered(subs)},
                     {"userEnteredValue": entered(joined)},
                     {"userEnteredValue": entered(left)},
                 ]}],
-                "fields": "userEnteredValue",
+                "fields": "userEnteredValue,userEnteredFormat.numberFormat",
             }
         },
         {
@@ -772,32 +929,11 @@ async def main(settings=None):
         print(f"Канал: {ch.title} | Подписчики: {subs}")
 
         # --- Сбор постов ---
-        posts=[]
+        messages = []
         async for msg in tg.iter_messages(
                 settings.channel, limit=settings.post_fetch_limit):
-            # Медиа-пост без подписи тоже является постом; пропускаются только
-            # служебные события без текста и медиа.
-            if not msg.message and not msg.media:
-                continue
-            views=msg.views or 0; forwards=msg.forwards or 0
-            replies=(msg.replies.replies if msg.replies else 0)
-            rt,rd=0,{}
-            if msg.reactions:
-                for r in msg.reactions.results:
-                    e = (r.reaction.emoticon if hasattr(r.reaction, "emoticon")
-                         else type(r.reaction).__name__)
-                    rd[e] = rd.get(e, 0) + r.count
-                    rt += r.count
-            posts.append({
-                "id":msg.id,
-                # Дата всегда в UTC - от этого зависит расчёт окон 24ч/72ч
-                "date":msg.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "text_preview":((msg.message or "[медиа без подписи]")[:80]
-                                .replace("\n", " ")),
-                "views":views,"forwards":forwards,"replies":replies,
-                "reactions_total":rt,"reactions_fmt":fmt_reactions(rd),
-                "err":engagement_rate(rt, forwards, replies, views),
-            })
+            messages.append(msg)
+        posts = collapse_telegram_messages(messages)
         print(f"Постов: {len(posts)}")
 
         # --- Слепок аудитории (только псевдонимные ID) ---

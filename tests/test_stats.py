@@ -20,6 +20,20 @@ def post(post_id, date, views, reactions=0, forwards=0, replies=0):
     }
 
 
+class FakeMessage:
+    def __init__(self, message_id, text=None, media=True, grouped_id=None,
+                 views=10):
+        self.id = message_id
+        self.message = text
+        self.media = media
+        self.grouped_id = grouped_id
+        self.views = views
+        self.forwards = 0
+        self.replies = None
+        self.reactions = None
+        self.date = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+
 class StatisticsLogicTests(unittest.TestCase):
     def test_settings_are_loaded_only_when_requested(self):
         environment = {
@@ -39,6 +53,9 @@ class StatisticsLogicTests(unittest.TestCase):
     def test_err_includes_all_interactions(self):
         self.assertEqual(stats.engagement_rate(10, 3, 2, 100), 15.0)
         self.assertEqual(stats.engagement_rate(10, 3, 2, 0), 0)
+
+    def test_err_rounding_matches_google_sheets(self):
+        self.assertEqual(stats.engagement_rate(1, 0, 0, 80), 1.3)
 
     def test_weekly_summary_is_chronological_and_weighted(self):
         posts = [
@@ -68,6 +85,41 @@ class StatisticsLogicTests(unittest.TestCase):
         self.assertEqual(rows[2][9], 50)
         self.assertEqual(rows[2][12], "важная заметка")
         self.assertEqual({item["id"] for item in analytics}, {1, 2})
+
+    def test_media_album_is_one_post_and_standalone_media_is_kept(self):
+        posts = stats.collapse_telegram_messages([
+            FakeMessage(8, grouped_id=100, views=120),
+            FakeMessage(7, text="подпись альбома", grouped_id=100, views=100),
+            FakeMessage(6, views=50),
+            FakeMessage(5, media=False),
+        ])
+
+        self.assertEqual([item["id"] for item in posts], [7, 6])
+        self.assertEqual(posts[0]["component_ids"], [7, 8])
+        self.assertEqual(posts[0]["views"], 100)
+        self.assertEqual(posts[1]["text_preview"], "[медиа без подписи]")
+
+    def test_album_cleanup_migrates_manual_history(self):
+        existing = [
+            stats.POST_HEADER,
+            [8, "2026-01-01 10:00", "url8", "[медиа без подписи]",
+             120, "", 95, 0, "—", "", "", "", "заметка 2", 0, 0, ""],
+            [7, "2026-01-01 10:00", "url7", "подпись", 100, 80, "",
+             4, "👍 4", 50, "", "", "заметка 1", 1, 2, ""],
+        ]
+        fresh = [post(7, "2026-01-01 10:00", 110, reactions=5)]
+        fresh[0]["component_ids"] = [7, 8]
+
+        rows, analytics = stats.build_post_rows(
+            existing, fresh, 60, "@channel",
+            now=datetime(2026, 1, 4, 12, tzinfo=timezone.utc))
+
+        self.assertEqual([row[0] for row in rows[1:]], [7])
+        self.assertEqual(rows[1][5], 80)
+        self.assertEqual(rows[1][6], 95)
+        self.assertEqual(rows[1][9], 50)
+        self.assertEqual(rows[1][12], "заметка 1\nзаметка 2")
+        self.assertEqual([item["id"] for item in analytics], [7])
 
     def test_post_links_support_common_channel_formats(self):
         self.assertEqual(stats.post_url("@name", 5), "https://t.me/name/5")
@@ -138,6 +190,11 @@ class FakeWorksheet:
             return FakeCell("Дата (UTC)")
         return FakeCell(None)
 
+    def get(self, _address, value_render_option=None):
+        if self.title == "Динамика":
+            return [[46000.0], ["2026-09-18 07:50"]]
+        return []
+
 
 class FakeBook:
     def __init__(self):
@@ -169,8 +226,20 @@ class DynamicsWriteTests(unittest.TestCase):
         append = next(request["appendCells"] for request in requests
                       if "appendCells" in request)
         values = append["rows"][0]["values"]
+        self.assertIn("numberValue", values[0]["userEnteredValue"])
+        self.assertEqual(
+            values[0]["userEnteredFormat"]["numberFormat"]["type"],
+            "DATE_TIME")
         self.assertEqual(values[2]["userEnteredValue"]["numberValue"], 1)
         self.assertEqual(values[3]["userEnteredValue"]["numberValue"], 1)
+
+        repairs = [request["updateCells"] for request in requests
+                   if request.get("updateCells", {}).get("start", {}).get(
+                       "sheetId") == 2]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["start"]["rowIndex"], 2)
+        repaired_cell = repairs[0]["rows"][0]["values"][0]
+        self.assertIn("numberValue", repaired_cell["userEnteredValue"])
 
 
 if __name__ == "__main__":
