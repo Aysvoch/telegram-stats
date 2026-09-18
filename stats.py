@@ -20,8 +20,10 @@ import os
 import glob
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from typing import Optional
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -34,29 +36,52 @@ from gspread_formatting import (
 from gspread_formatting.batch_update_requests import _build_repeat_cell_request
 from google.oauth2.service_account import Credentials
 
-# Подхватываем .env (локальный запуск). В облаке файла нет - не страшно.
-load_dotenv()
-
 # ---------- Секреты и константы ----------
 
-# Понятная ошибка вместо криптоватого TypeError, если .env не подхватился
-_missing = [k for k in ("API_ID", "API_HASH", "CHANNEL", "SPREADSHEET_ID")
-            if not os.getenv(k)]
-if _missing:
-    raise SystemExit(
-        f"Не найдены переменные окружения: {', '.join(_missing)}. "
-        "Проверь файл .env (локально) или секреты репозитория (GitHub Actions).")
+@dataclass(frozen=True)
+class Settings:
+    api_id: int
+    api_hash: str
+    channel: str
+    spreadsheet_id: str
+    service_account_file: Optional[str]
+    post_fetch_limit: Optional[int]
 
-API_ID   = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-CHANNEL  = os.getenv("CHANNEL")
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+def load_settings():
+    """Загружает настройки только при реальном запуске приложения.
 
-# Имя json-ключа не зашито в код: репозиторий публичный, а само имя файла
-# раскрывало бы id проекта Google. Локально берём путь из переменной
-# SERVICE_ACCOUNT_FILE, а если её нет - ищем единственный json рядом со скриптом.
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
+    Импорт модуля (например, из тестов) не читает локальный .env и не требует
+    секретов. POST_FETCH_LIMIT=0 означает загрузку всей истории канала.
+    """
+    load_dotenv()
+    required = ("API_ID", "API_HASH", "CHANNEL", "SPREADSHEET_ID")
+    missing = [key for key in required if not os.getenv(key)]
+    if missing:
+        raise SystemExit(
+            f"Не найдены переменные окружения: {', '.join(missing)}. "
+            "Проверь локальные настройки или секреты GitHub Actions.")
+
+    try:
+        api_id = int(os.environ["API_ID"])
+    except ValueError as exc:
+        raise SystemExit("API_ID должен быть целым числом.") from exc
+
+    raw_limit = os.getenv("POST_FETCH_LIMIT", "0").strip()
+    try:
+        parsed_limit = int(raw_limit)
+    except ValueError as exc:
+        raise SystemExit("POST_FETCH_LIMIT должен быть целым числом.") from exc
+    post_fetch_limit = parsed_limit if parsed_limit > 0 else None
+
+    return Settings(
+        api_id=api_id,
+        api_hash=os.environ["API_HASH"],
+        channel=os.environ["CHANNEL"],
+        spreadsheet_id=os.environ["SPREADSHEET_ID"],
+        service_account_file=os.getenv("SERVICE_ACCOUNT_FILE"),
+        post_fetch_limit=post_fetch_limit,
+    )
 
 # ---------- Палитра оформления ----------
 
@@ -66,8 +91,8 @@ TEAL_ROW   = Color(0.878, 0.961, 0.961)   # чётные строки
 BLUE_ROW   = Color(0.918, 0.945, 0.980)   # нечётные строки
 CARD_BG    = Color(0.925, 0.949, 0.992)   # фон KPI-карточек
 GREEN_VAL  = Color(0.047, 0.525, 0.298)   # цифры KPI
-GREEN_HL   = Color(0.812, 0.941, 0.843)   # подсветка постов с высоким ER
-RED_HL     = Color(0.996, 0.882, 0.882)   # подсветка постов с низким ER
+GREEN_HL   = Color(0.812, 0.941, 0.843)   # подсветка постов с высоким ERR
+RED_HL     = Color(0.996, 0.882, 0.882)   # подсветка постов с низким ERR
 WHITE      = Color(1, 1, 1)
 GRAY       = Color(0.35, 0.35, 0.35)
 DARK       = Color(0.08, 0.08, 0.08)
@@ -93,18 +118,18 @@ FMT_MANUAL = mk(Color(1.0, 0.992, 0.929), size=9)  # жёлтый: ячейки,
 
 # ---------- Подключение к Google Sheets ----------
 
-def find_local_key():
+def find_local_key(configured_path):
     """Путь к json-ключу Google для локального запуска.
 
     Сначала смотрим переменную SERVICE_ACCOUNT_FILE. Если её нет - ищем
     единственный json-файл в папке со скриптом (json-ы в git не попадают,
     см. .gitignore). Несколько файлов или ни одного - понятная ошибка.
     """
-    if SERVICE_ACCOUNT_FILE:
-        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+    if configured_path:
+        if not os.path.exists(configured_path):
             raise SystemExit(
-                f"Локальный запуск: не найден файл ключа {SERVICE_ACCOUNT_FILE}.")
-        return SERVICE_ACCOUNT_FILE
+                f"Локальный запуск: не найден файл ключа {configured_path}.")
+        return configured_path
 
     here = os.path.dirname(os.path.abspath(__file__))
     found = sorted(glob.glob(os.path.join(here, "*.json")))
@@ -118,7 +143,8 @@ def find_local_key():
         "Локальный запуск: в папке несколько json-файлов. "
         "Укажи нужный в переменной SERVICE_ACCOUNT_FILE (файл .env).")
 
-def get_book():
+
+def get_book(settings):
     """Открывает таблицу. Сам определяет режим:
     - есть переменная GOOGLE_CREDENTIALS -> облако (GitHub Actions)
     - нет -> локальный запуск, ключ читаем из json-файла рядом со скриптом
@@ -136,9 +162,9 @@ def get_book():
             json.loads(creds_env), scopes=scopes)
     else:
         creds = Credentials.from_service_account_file(
-            find_local_key(), scopes=scopes)
+            find_local_key(settings.service_account_file), scopes=scopes)
     client = gspread.authorize(creds, http_client=gspread.BackOffHTTPClient)
-    return client.open_by_key(SPREADSHEET_ID)
+    return client.open_by_key(settings.spreadsheet_id)
 
 # ---------- Мелкие помощники для Google Sheets API ----------
 
@@ -151,8 +177,9 @@ def get_or_create(book, title):
 def push(book, reqs):
     """Отправляет пачку запросов форматирования одним вызовом
     (экономит квоту Google на количество обращений)."""
-    if reqs:
-        book.batch_update({"requests": reqs})
+    reqs = [request for request in reqs if request]
+    for start in range(0, len(reqs), 400):
+        book.batch_update({"requests": reqs[start:start + 400]})
 
 def fmt(ws, a1, f):
     """Запрос: применить формат f к диапазону a1."""
@@ -168,17 +195,21 @@ def unmerge(ws):
     """Запрос: снять все объединения на листе (перед перезаписью)."""
     return {"unmergeCells": {"range": {
         "sheetId": ws.id,
-        "startRowIndex": 0, "endRowIndex": 500,
-        "startColumnIndex": 0, "endColumnIndex": 20}}}
+        "startRowIndex": 0, "endRowIndex": ws.row_count,
+        "startColumnIndex": 0, "endColumnIndex": ws.col_count}}}
 
 def hide_cols(ws, start, end):
     """Запрос: скрыть колонки с start по end (индексы с нуля)."""
+    if start >= end:
+        return None
     return {"updateDimensionProperties": {
         "range": {"sheetId": ws.id, "dimension": "COLUMNS",
                   "startIndex": start, "endIndex": end},
         "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}}
 
 def hide_rows(ws, start, end):
+    if start >= end:
+        return None
     return {"updateDimensionProperties": {
         "range": {"sheetId": ws.id, "dimension": "ROWS",
                   "startIndex": start, "endIndex": end},
@@ -217,167 +248,265 @@ def fmt_reactions(d):
     """Словарь реакций {эмодзи: число} -> строка 'эмодзи N  эмодзи N'."""
     return "—" if not d else "  ".join(f"{e} {c}" for e, c in d.items())
 
+
+def as_number(value, default=0):
+    """Число из Google Sheets с поддержкой запятой и пробелов в локали."""
+    if isinstance(value, (int, float)):
+        return value
+    normalized = str(value).strip().replace("\u00a0", "").replace(" ", "")
+    if not normalized:
+        return default
+    try:
+        return float(normalized.replace(",", "."))
+    except ValueError:
+        return default
+
+
+def engagement_rate(reactions, forwards, replies, views):
+    """ERR: все измеряемые взаимодействия относительно просмотров."""
+    return round((reactions + forwards + replies) / views * 100, 1) if views else 0
+
+
 def week_label(date_str):
-    """Дата поста -> метка недели вида 'Нед.27 29.06–05.07'."""
+    """Дата поста -> метка недели с годом, чтобы годы не смешивались."""
     dt  = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
     mon = dt - timedelta(days=dt.weekday())
     sun = mon + timedelta(days=6)
-    return f"Нед.{dt.isocalendar()[1]} {mon.strftime('%d.%m')}–{sun.strftime('%d.%m')}"
+    iso_year, iso_week, _ = dt.isocalendar()
+    return f"{iso_year} · Нед.{iso_week:02d} {mon.strftime('%d.%m')}–{sun.strftime('%d.%m')}"
 
-def post_url(msg_id):
-    return f"https://t.me/{CHANNEL}/{msg_id}"
+
+def weekly_summary(posts):
+    """Хронологическая недельная агрегация без строковой сортировки."""
+    weeks = defaultdict(lambda: {
+        "posts": 0, "views": 0, "reactions": 0,
+        "forwards": 0, "replies": 0,
+    })
+    for post in posts:
+        dt = datetime.strptime(post["date"], "%Y-%m-%d %H:%M")
+        monday = (dt - timedelta(days=dt.weekday())).date()
+        weeks[monday]["posts"] += 1
+        weeks[monday]["views"] += post["views"]
+        weeks[monday]["reactions"] += post["reactions_total"]
+        weeks[monday]["forwards"] += post["forwards"]
+        weeks[monday]["replies"] += post["replies"]
+
+    result = []
+    for monday, data in sorted(weeks.items()):
+        count = data["posts"]
+        sample_date = datetime.combine(monday, datetime.min.time())
+        result.append([
+            week_label(sample_date.strftime("%Y-%m-%d %H:%M")),
+            count,
+            round(data["views"] / count) if count else 0,
+            engagement_rate(
+                data["reactions"], data["forwards"],
+                data["replies"], data["views"]),
+        ])
+    return result
+
+
+def post_url(channel, msg_id):
+    """Ссылка на пост для username, t.me URL или внутреннего -100 ID."""
+    value = str(channel).strip().rstrip("/")
+    if value.startswith("https://t.me/"):
+        return f"{value}/{msg_id}"
+    value = value.lstrip("@")
+    if value.startswith("-100") and value[4:].isdigit():
+        return f"https://t.me/c/{value[4:]}/{msg_id}"
+    return f"https://t.me/{value}/{msg_id}"
+
+
+def calculate_audience_delta(old_ids, new_ids, initialized):
+    """Возвращает приток/отток; первый снимок задаёт точку отсчёта."""
+    if not initialized:
+        return "", ""
+    return len(new_ids - old_ids), len(old_ids - new_ids)
 
 # ============================================================
 #  ЛИСТ «ПОСТЫ»
 # ============================================================
 
-def write_posts(ws, book, posts, subscribers):
-    # --- Шаг 1. Сохраняем то, что нельзя потерять при перезаписи ---
-    # Лист полностью очищается на каждом запуске, поэтому сначала читаем
-    # текущие значения ячеек, которые заполняются один раз или вручную:
-    # F (просм. 24ч), G (просм. 72ч), J (подписчики на момент поста), M (заметки).
-    existing = ws.get_all_values()
-    existing_map = {}
-    for i, row in enumerate(existing[1:], start=2):
-        if row and row[0]:
-            try:
-                existing_map[int(row[0])] = {
-                    "row":       i,
-                    "views_24h": row[5] if len(row) > 5 else "",
-                    "views_72h": row[6] if len(row) > 6 else "",
-                    "subs":      row[9] if len(row) > 9 else "",
-                    "comment":   row[12] if len(row) > 12 else "",
-                }
-            except (ValueError, IndexError):
-                pass
+POST_HEADER = [
+    "ID", "Дата", "Ссылка", "Превью текста", "Просм. сейчас",
+    "Просм. 24ч", "Просм. 72ч", "Реакции (всего)",
+    "Реакции (детально)", "Подписчики", "1-Day Reach %",
+    "Реакции / просмотры %", "Комментарий ✏️", "Пересылки",
+    "Комментарии (шт)", "ERR %",
+]
 
-    push(book, [unmerge(ws), show_cols(ws, 20), show_rows(ws, 500)])
-    ws.clear(); time.sleep(1)
 
-    # Новые колонки (N, O, P) добавлены строго В КОНЕЦ таблицы, чтобы
-    # existing_map выше продолжал читать старые данные по прежним индексам A-M.
-    header = ["ID","Дата","Ссылка","Превью текста","Просм. сейчас",
-              "Просм. 24ч","Просм. 72ч","Реакции (всего)",
-              "Реакции (детально)","Подписчики","1-Day Reach %","ER поста %","Комментарий ✏️",
-              "Пересылки","Комментарии (шт)","ERR %"]
+def _existing_posts(values):
+    result = {}
+    for row in values[1:]:
+        if not row or not str(row[0]).strip().isdigit():
+            continue
+        padded = list(row[:16]) + [""] * max(0, 16 - len(row))
+        for index in (0, 4, 5, 6, 7, 9, 13, 14):
+            if padded[index] in (None, ""):
+                continue
+            number = as_number(padded[index], default=None)
+            if number is not None:
+                padded[index] = int(number) if float(number).is_integer() else number
+        result[int(row[0])] = padded[:16]
+    return result
 
-    # --- Шаг 2. Собираем строки + автозаполнение 24ч/72ч ---
-    rows = [header]
-    now = datetime.now(timezone.utc)
-    for p in posts:
-        ex = existing_map.get(p["id"], {})
-        subs_val = ex.get("subs") or subscribers
 
-        # Возраст поста в часах. Дата в p["date"] всегда в UTC.
-        post_dt = datetime.strptime(p["date"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+def _analytics_post(row):
+    reactions = as_number(row[7])
+    forwards = as_number(row[13])
+    replies = as_number(row[14])
+    views = as_number(row[4])
+    return {
+        "id": int(row[0]),
+        "date": row[1],
+        "text_preview": row[3],
+        "views": views,
+        "forwards": forwards,
+        "replies": replies,
+        "reactions_total": reactions,
+        "err": engagement_rate(reactions, forwards, replies, views),
+    }
+
+
+def build_post_rows(existing_values, posts, subscribers, channel, now=None):
+    """Объединяет свежие данные с историей, не удаляя старые посты."""
+    existing = _existing_posts(existing_values)
+    fresh = {post["id"]: post for post in posts}
+    now = now or datetime.now(timezone.utc)
+    rows_by_id = {}
+
+    for post_id in sorted(set(existing) | set(fresh), reverse=True):
+        old = existing.get(post_id, [""] * 16)
+        if post_id not in fresh:
+            old[10] = old[11] = old[15] = ""  # формулы восстановятся ниже
+            rows_by_id[post_id] = old
+            continue
+
+        post = fresh[post_id]
+        post_dt = datetime.strptime(
+            post["date"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
         age_h = (now - post_dt).total_seconds() / 3600
 
-        # Логика автозаполнения:
-        #  - пишем ТЕКУЩИЕ просмотры, только если ячейка ещё пустая
-        #    и пост находится в окне 24-48ч (для F) / 72-96ч (для G);
-        #  - широкое окно = 3-4 попытки при запуске каждые 6 часов,
-        #    один сбойный запуск ничего не ломает;
-        #  - заполненные (в т.ч. вручную) значения НИКОГДА не перезаписываем;
-        #  - окно упущено -> ячейка честно остаётся пустой.
-        views_24h = ex.get("views_24h", "")
-        if not views_24h and 24 <= age_h < 48:
-            views_24h = p["views"]
+        views_24h = old[5]
+        if views_24h in (None, "") and 24 <= age_h < 48:
+            views_24h = post["views"]
 
-        views_72h = ex.get("views_72h", "")
-        if not views_72h and 72 <= age_h < 96:
-            views_72h = p["views"]
+        views_72h = old[6]
+        if views_72h in (None, "") and 72 <= age_h < 96:
+            views_72h = post["views"]
 
-        rows.append([
-            p["id"], p["date"], post_url(p["id"]), p["text_preview"],
-            p["views"],
-            views_24h,
-            views_72h,
-            p["reactions_total"], p["reactions_fmt"],
-            subs_val, "", "", ex.get("comment", ""),
-            p["forwards"], p["replies"], "",
+        # Историческое число подписчиков нельзя восстановить задним числом.
+        # Для впервые увиденного старого поста оставляем пусто, а не подставляем
+        # сегодняшнее значение под видом значения на момент публикации.
+        subs_at_post = old[9]
+        if subs_at_post in (None, "") and age_h <= 12:
+            subs_at_post = subscribers
+
+        rows_by_id[post_id] = [
+            post_id, post["date"], post_url(channel, post_id),
+            post["text_preview"], post["views"], views_24h, views_72h,
+            post["reactions_total"], post["reactions_fmt"],
+            subs_at_post, "", "", old[12],
+            post["forwards"], post["replies"], "",
+        ]
+
+    data_rows = [rows_by_id[post_id] for post_id in sorted(rows_by_id, reverse=True)]
+    return [POST_HEADER, *data_rows], [_analytics_post(row) for row in data_rows]
+
+
+def write_posts(ws, book, posts, subscribers, channel):
+    existing_values = ws.get_all_values()
+    rows, analytics_posts = build_post_rows(
+        existing_values, posts, subscribers, channel)
+
+    required_rows = max(len(rows) + 20, 500)
+    if ws.row_count < required_rows or ws.col_count < 20:
+        ws.resize(rows=max(ws.row_count, required_rows),
+                  cols=max(ws.col_count, 20))
+
+    # Один RAW update не исполняет Telegram-текст как формулу. В отличие от
+    # clear()+update, ошибка запроса оставляет предыдущую таблицу целой.
+    push(book, [unmerge(ws), show_cols(ws, 20), show_rows(ws, ws.row_count)])
+    ws.update(values=rows, range_name="A1", value_input_option="RAW")
+
+    formula_updates = []
+    for i in range(2, len(rows) + 1):
+        formula_updates.extend([
+            {
+                "range": f"K{i}",
+                "values": [[f'=IF(F{i}="";"";IFERROR(ROUND(F{i}/J{i}*100;1);""))']],
+            },
+            {
+                "range": f"L{i}",
+                "values": [[f"=IFERROR(ROUND(H{i}/E{i}*100;1);0)"]],
+            },
+            {
+                "range": f"P{i}",
+                "values": [[f"=IFERROR(ROUND((H{i}+N{i}+O{i})/E{i}*100;1);0)"]],
+            },
+        ])
+    for start in range(0, len(formula_updates), 500):
+        ws.batch_update(
+            formula_updates[start:start + 500],
+            value_input_option="USER_ENTERED")
+
+    set_column_widths(ws, [("A", 52), ("B", 130), ("C", 180), ("D", 270),
+                           ("E", 100), ("F", 105), ("G", 105), ("H", 110),
+                           ("I", 200), ("J", 105), ("K", 110), ("L", 130),
+                           ("M", 160), ("N", 95), ("O", 120), ("P", 90)])
+    set_row_height(ws, "1", 34)
+
+    reqs = [fmt(ws, "A1:P1", FMT_H)]
+    for i, post in enumerate(analytics_posts, start=2):
+        err = post["err"]
+        base = (FMT_GREEN if err > 20 else FMT_RED if err < 5 else
+                FMT_EVEN if i % 2 == 0 else FMT_ODD)
+        reqs.extend([
+            fmt(ws, f"A{i}:P{i}", base),
+            fmt(ws, f"F{i}", FMT_MANUAL),
+            fmt(ws, f"G{i}", FMT_MANUAL),
+            fmt(ws, f"M{i}", FMT_MANUAL),
         ])
 
-    ws.update(values=rows, range_name="A1"); time.sleep(1)
-
-    # --- Шаг 3. Формулы ---
-    # ВАЖНО: разделитель аргументов - точка с запятой ";", а не запятая.
-    # Таблица в русской локали, где запятая = десятичный знак,
-    # и формулы с запятыми дают "Синтаксическую ошибку".
-    # Точку с запятой Google Sheets принимает в любой локали.
-    #
-    # K (1-Day Reach %): пока F пустая - показываем пустоту, а не ноль,
-    #   чтобы не портить средние значения фальшивыми нулями.
-    # L (ER %): реакции / подписчики - старая метрика, оставлена для
-    #   сопоставимости с накопленной историей.
-    # P (ERR %): (реакции + пересылки + комментарии) / просмотры -
-    #   более полная метрика вовлечённости; IFERROR защищает от деления на 0.
-    formula_updates = []
-    for i in range(2, len(posts) + 2):
-        formula_updates.append({
-            "range": f"K{i}",
-            "values": [[f'=IF(F{i}="";"";ROUND(F{i}/J{i}*100;1))']]
-        })
-        formula_updates.append({
-            "range": f"L{i}",
-            "values": [[f"=IFERROR(ROUND(H{i}/J{i}*100;1);0)"]]
-        })
-        formula_updates.append({
-            "range": f"P{i}",
-            "values": [[f"=IFERROR(ROUND((H{i}+N{i}+O{i})/E{i}*100;1);0)"]]
-        })
-    if formula_updates:
-        ws.batch_update(formula_updates, value_input_option="USER_ENTERED")
-    time.sleep(1)
-
-    # --- Шаг 4. Оформление ---
-    set_column_widths(ws,[("A",52),("B",130),("C",180),("D",270),
-                          ("E",100),("F",105),("G",105),("H",110),
-                          ("I",200),("J",105),("K",110),("L",100),("M",160),
-                          ("N",95),("O",120),("P",90)])
-    set_row_height(ws,"1",34)
-
-    reqs = [fmt(ws,"A1:P1", FMT_H)]
-    for i, p in enumerate(posts, start=2):
-        er = p["er"]
-        # Подсветка строки по вовлечённости: зелёная/красная/обычная зебра
-        base = (FMT_GREEN if er > 50 else FMT_RED if er < 20 else
-                FMT_EVEN if i%2==0 else FMT_ODD)
-        reqs.append(fmt(ws, f"A{i}:P{i}", base))
-        # Жёлтым - ячейки, куда допустим ручной ввод
-        reqs.append(fmt(ws, f"F{i}", FMT_MANUAL))
-        reqs.append(fmt(ws, f"G{i}", FMT_MANUAL))
-        reqs.append(fmt(ws, f"M{i}", FMT_MANUAL))
-
-    last = len(posts) + 1
-    reqs += [
+    last = len(rows)
+    reqs.extend([
         border(ws, f"A1:P{last}"),
-        hide_cols(ws, 16, 20),     # скрываем всё правее колонки P
-        hide_rows(ws, last, 500),  # скрываем пустые строки снизу
-        note_req(ws,"F1","Заполняется автоматически через ~24 часа после публикации. Можно ввести вручную - скрипт не перезапишет."),
-        note_req(ws,"G1","Заполняется автоматически через ~72 часа после публикации. Можно ввести вручную - скрипт не перезапишет."),
-        note_req(ws,"M1","Вводи вручную: заметки и наблюдения по посту"),
-    ]
+        hide_cols(ws, 16, ws.col_count),
+        note_req(ws, "F1", "Фиксируется автоматически через ~24 часа; ручное значение сохраняется."),
+        note_req(ws, "G1", "Фиксируется автоматически через ~72 часа; ручное значение сохраняется."),
+        note_req(ws, "M1", "Ручные заметки и наблюдения по посту"),
+    ])
+    if last < ws.row_count:
+        reqs.append(hide_rows(ws, last, ws.row_count))
     push(book, reqs)
     set_frozen(ws, rows=1)
+    return analytics_posts
 
 # ============================================================
 #  ЛИСТ «ДАШБОРД»
 # ============================================================
 
 def write_dashboard(ws, book, posts, subs):
-    push(book,[unmerge(ws), show_cols(ws,20), show_rows(ws,500)])
-    ws.clear(); time.sleep(1)
+    push(book,[unmerge(ws), show_cols(ws, ws.col_count),
+               show_rows(ws, ws.row_count)])
 
-    # KPI-карточки: подписчики, постов всего, средние просмотры, средний ER
+    # KPI-карточки: подписчики, постов всего, средние просмотры, взвешенный ERR
     n      = len(posts)
     avg_v  = round(sum(p["views"] for p in posts)/n) if n else 0
-    avg_er = round(sum(p["er"]   for p in posts)/n,1) if n else 0
+    total_views = sum(p["views"] for p in posts)
+    avg_err = engagement_rate(
+        sum(p["reactions_total"] for p in posts),
+        sum(p["forwards"] for p in posts),
+        sum(p["replies"] for p in posts),
+        total_views,
+    )
 
     kpi = [
         ("👥 Подписчики",        subs,         "A","B",0,1),
         ("📝 Постов",            n,             "C","D",2,3),
         ("👁 Средние просмотры", avg_v,         "E","F",4,5),
-        ("⚡ Средний ER%",       f"{avg_er}%",  "G","H",6,7),
+        ("⚡ Взвешенный ERR%",   f"{avg_err}%", "G","H",6,7),
     ]
     for lbl,val,c1,c2,_,__ in kpi:
         ws.update(values=[[lbl]], range_name=f"{c1}1")
@@ -398,10 +527,11 @@ def write_dashboard(ws, book, posts, subs):
     # Топ-5 постов по просмотрам
     top5 = sorted(posts,key=lambda x: x["views"],reverse=True)[:5]
     ws.update(values=[["🏆 ТОП-5 постов по просмотрам"]], range_name="A4")
-    ws.update(values=[["Дата","Просмотры","ER%","Превью текста"]], range_name="A5")
-    for i,t in enumerate(top5):
-        ws.update(values=[[t["date"],t["views"],t["er"],t["text_preview"]]],
-                  range_name=f"A{6+i}")
+    ws.update(values=[["Дата","Просмотры","ERR%","Превью текста"]], range_name="A5")
+    top_rows = [[t["date"], t["views"], t["err"], t["text_preview"]]
+                for t in top5]
+    top_rows.extend([["", "", "", ""]] * (5 - len(top_rows)))
+    ws.update(values=top_rows, range_name="A6")
     time.sleep(1)
 
     reqs = [merge(ws,"A4:H4"), fmt(ws,"A4:H4",FMT_SEC),
@@ -415,20 +545,12 @@ def write_dashboard(ws, book, posts, subs):
     set_row_height(ws,"4",30)
     set_column_widths(ws,[("D",360)])
 
-    # Понедельная сводка: постов, средние просмотры, средний ER
-    weeks = defaultdict(lambda:{"posts":0,"views":0,"er":0.0})
-    for p in posts:
-        lb=week_label(p["date"])
-        weeks[lb]["posts"]+=1; weeks[lb]["views"]+=p["views"]; weeks[lb]["er"]+=p["er"]
-
-    week_data=[[lb,d["posts"],
-                round(d["views"]/d["posts"]) if d["posts"] else 0,
-                round(d["er"]/d["posts"],1)  if d["posts"] else 0]
-               for lb,d in sorted(weeks.items())]
+    # Понедельная сводка: сортировка по дате, ERR взвешен по просмотрам.
+    week_data = weekly_summary(posts)
 
     SR=12
     ws.update(values=[["📅 Динамика по неделям"]], range_name=f"A{SR}")
-    ws.update(values=[["Неделя","Постов","Средние просмотры","Средний ER%"]],
+    ws.update(values=[["Неделя","Постов","Средние просмотры","Взвешенный ERR%"]],
               range_name=f"A{SR+1}")
     if week_data:
         ws.update(values=week_data, range_name=f"A{SR+2}")
@@ -440,8 +562,10 @@ def write_dashboard(ws, book, posts, subs):
     for i in range(len(week_data)):
         row=SR+2+i
         reqs.append(fmt(ws,f"A{row}:D{row}",FMT_EVEN if i%2==0 else FMT_ODD))
-    reqs+=[border(ws,f"A{SR}:D{last_w}"),
-           hide_cols(ws,8,20), hide_rows(ws,last_w,500)]
+    reqs += [border(ws, f"A{SR}:D{last_w}"),
+             hide_cols(ws, 8, ws.col_count)]
+    if last_w < ws.row_count:
+        reqs.append(hide_rows(ws, last_w, ws.row_count))
     push(book,reqs)
     set_row_height(ws,str(SR),30)
     set_frozen(ws,rows=3)
@@ -467,6 +591,7 @@ def write_dynamics(book, current_ids, subs):
     old_vals = aud.col_values(1)
     old_ids = set(int(v) for v in old_vals if str(v).strip().isdigit())
     new_ids = set(current_ids)
+    initialized = aud.acell("B1").value == "initialized" or bool(old_ids)
 
     # 2. Лист "Динамика": проверяем шапку по содержимому ячейки A1.
     #    Если её нет (первый запуск или шапка потерялась) - ВСТАВЛЯЕМ строку
@@ -477,13 +602,13 @@ def write_dynamics(book, current_ids, subs):
         time.sleep(1)
         set_column_widths(dyn, [("A", 150), ("B", 110), ("C", 90), ("D", 90)])
         set_row_height(dyn, "1", 34)
-        reqs = [fmt(dyn, "A1:D1", FMT_H), hide_cols(dyn, 4, 20)]
+        reqs = [fmt(dyn, "A1:D1", FMT_H), hide_cols(dyn, 4, dyn.col_count)]
         # Автоматическая "зебра" на будущие строки: полосатый диапазон
         # сам красит каждую новую строку, ничего дописывать не нужно
         try:
             reqs.append({"addBanding": {"bandedRange": {
                 "range": {"sheetId": dyn.id,
-                          "startRowIndex": 1, "endRowIndex": 500,
+                          "startRowIndex": 1, "endRowIndex": dyn.row_count,
                           "startColumnIndex": 0, "endColumnIndex": 4},
                 "rowProperties": {
                     "firstBandColor":  {"red": 0.878, "green": 0.961, "blue": 0.961},
@@ -496,33 +621,83 @@ def write_dynamics(book, current_ids, subs):
             push(book, reqs[:-1])
         set_frozen(dyn, rows=1)
 
-    # 3. Приток/отток. Самый первый запуск - точка отсчёта:
-    #    сравнивать не с чем, оставляем Пришло/Ушло пустыми.
-    if old_ids:
-        joined = len(new_ids - old_ids)
-        left   = len(old_ids - new_ids)
-    else:
-        joined, left = "", ""
+    # 3. Приток/отток. Первый снимок задаёт точку отсчёта.
+    joined, left = calculate_audience_delta(old_ids, new_ids, initialized)
+    captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
-    dyn.append_row(
-        [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), subs, joined, left],
-        value_input_option="USER_ENTERED")
+    if aud.row_count < max(len(new_ids), 2):
+        aud.resize(rows=max(len(new_ids) + 100, 2),
+                   cols=max(aud.col_count, 2))
 
-    # 4. Обновляем слепок и держим лист скрытым
-    aud.clear(); time.sleep(1)
+    def entered(value):
+        if isinstance(value, (int, float)):
+            return {"numberValue": value}
+        return {"stringValue": str(value)}
+
+    # Очистка старого снимка, запись нового и append истории входят в один
+    # spreadsheets.batchUpdate. Google применяет такой пакет целиком: не будет
+    # состояния, где история уже дописана, а снимок ещё старый (или наоборот).
+    requests = [{
+        "repeatCell": {
+            "range": {
+                "sheetId": aud.id,
+                "startRowIndex": 0,
+                "endRowIndex": aud.row_count,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            },
+            "cell": {},
+            "fields": "userEnteredValue",
+        }
+    }]
     if new_ids:
-        aud.update(values=[[i] for i in sorted(new_ids)], range_name="A1")
-    push(book, [{"updateSheetProperties": {
-        "properties": {"sheetId": aud.id, "hidden": True},
-        "fields": "hidden"}}])
+        requests.append({
+            "updateCells": {
+                "start": {"sheetId": aud.id, "rowIndex": 0, "columnIndex": 0},
+                # ID храним строкой: Google Sheets использует double для чисел,
+                # а строка гарантирует точность 64-битного Telegram ID.
+                "rows": [{"values": [{"userEnteredValue": entered(str(user_id))}]}
+                         for user_id in sorted(new_ids)],
+                "fields": "userEnteredValue",
+            }
+        })
+    requests.extend([
+        {
+            "updateCells": {
+                "start": {"sheetId": aud.id, "rowIndex": 0, "columnIndex": 1},
+                "rows": [{"values": [{"userEnteredValue": entered("initialized")}]},
+                         {"values": [{"userEnteredValue": entered(captured_at)}]}],
+                "fields": "userEnteredValue",
+            }
+        },
+        {
+            "appendCells": {
+                "sheetId": dyn.id,
+                "rows": [{"values": [
+                    {"userEnteredValue": entered(captured_at)},
+                    {"userEnteredValue": entered(subs)},
+                    {"userEnteredValue": entered(joined)},
+                    {"userEnteredValue": entered(left)},
+                ]}],
+                "fields": "userEnteredValue",
+            }
+        },
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": aud.id, "hidden": True},
+                "fields": "hidden",
+            }
+        },
+    ])
+    book.batch_update({"requests": requests})
 
 # ============================================================
 #  ЛИСТ «КАНАЛ»
 # ============================================================
 
 def write_channel(ws, book, ch, subs, desc):
-    push(book,[unmerge(ws), show_cols(ws,20), show_rows(ws,500)])
-    ws.clear(); time.sleep(1)
+    push(book,[unmerge(ws), show_cols(ws, ws.col_count),
+               show_rows(ws, ws.row_count)])
     ws.update(values=[
         ["Параметр",   "Значение",          "Обновлено"],
         ["Название",   ch.title,            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")],
@@ -537,7 +712,7 @@ def write_channel(ws, book, ch, subs, desc):
         fmt(ws,"A2:C2",FMT_EVEN), fmt(ws,"A3:C3",FMT_ODD),
         fmt(ws,"A4:C4",FMT_EVEN), fmt(ws,"A5:C5",FMT_ODD),
         border(ws,"A1:C5"),
-        hide_cols(ws,3,20), hide_rows(ws,5,500),
+        hide_cols(ws, 3, ws.col_count), hide_rows(ws, 5, ws.row_count),
     ])
     set_frozen(ws,rows=1)
 
@@ -545,7 +720,7 @@ def write_channel(ws, book, ch, subs, desc):
 #  ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================
 
-def make_client():
+def make_client(settings):
     """Выбор Telegram-сессии по режиму:
     - облако: строка SESSION_STRING из секретов (без интерактивного входа)
     - локально: файловая сессия session.session - телефон и код
@@ -553,70 +728,105 @@ def make_client():
     """
     session_str = os.getenv("SESSION_STRING")
     if session_str:
-        return TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    return TelegramClient("session", API_ID, API_HASH)
+        return TelegramClient(
+            StringSession(session_str), settings.api_id, settings.api_hash)
+    return TelegramClient("session", settings.api_id, settings.api_hash)
 
-async def main():
-    async with make_client() as tg:
+
+async def collect_subscriber_ids(tg, channel, expected_count):
+    """Возвращает полный проверенный снимок или None при любом сомнении."""
+    collected = []
+    try:
+        async for user in tg.iter_participants(channel):
+            collected.append(user.id)
+    except Exception as exc:
+        # Частичный результат намеренно отбрасывается: иначе он выглядит как
+        # массовый отток и повреждает следующий снимок.
+        print(f"⚠️ Снимок аудитории пропущен: {exc}")
+        return None
+
+    result = set(collected)
+    if len(result) != len(collected):
+        print("⚠️ Снимок аудитории пропущен: Telegram вернул дубли ID")
+        return None
+
+    if expected_count is not None:
+        tolerance = max(1, round(expected_count * 0.005))
+        if abs(len(result) - expected_count) > tolerance:
+            print(
+                "⚠️ Снимок аудитории пропущен: "
+                f"ожидалось около {expected_count}, получено {len(result)}")
+            return None
+
+    return result
+
+
+async def main(settings=None):
+    settings = settings or load_settings()
+    async with make_client(settings) as tg:
 
         # --- Паспорт канала ---
-        full=await tg(GetFullChannelRequest(CHANNEL))
+        full=await tg(GetFullChannelRequest(settings.channel))
         ch=full.chats[0]; subs=full.full_chat.participants_count
         desc=full.full_chat.about or ""
         print(f"Канал: {ch.title} | Подписчики: {subs}")
 
         # --- Сбор постов ---
         posts=[]
-        async for msg in tg.iter_messages(CHANNEL,limit=200):
-            if not msg.message: continue   # пропускаем служебные сообщения без текста
+        async for msg in tg.iter_messages(
+                settings.channel, limit=settings.post_fetch_limit):
+            # Медиа-пост без подписи тоже является постом; пропускаются только
+            # служебные события без текста и медиа.
+            if not msg.message and not msg.media:
+                continue
             views=msg.views or 0; forwards=msg.forwards or 0
             replies=(msg.replies.replies if msg.replies else 0)
             rt,rd=0,{}
             if msg.reactions:
                 for r in msg.reactions.results:
-                    e=r.reaction.emoticon if hasattr(r.reaction,"emoticon") else "?"
-                    rd[e]=r.count; rt+=r.count
+                    e = (r.reaction.emoticon if hasattr(r.reaction, "emoticon")
+                         else type(r.reaction).__name__)
+                    rd[e] = rd.get(e, 0) + r.count
+                    rt += r.count
             posts.append({
                 "id":msg.id,
                 # Дата всегда в UTC - от этого зависит расчёт окон 24ч/72ч
                 "date":msg.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "text_preview":(msg.message or "")[:80].replace("\n"," "),
+                "text_preview":((msg.message or "[медиа без подписи]")[:80]
+                                .replace("\n", " ")),
                 "views":views,"forwards":forwards,"replies":replies,
                 "reactions_total":rt,"reactions_fmt":fmt_reactions(rd),
-                "er":round(rt/views*100,1) if views else 0,
+                "err":engagement_rate(rt, forwards, replies, views),
             })
         print(f"Постов: {len(posts)}")
 
-        # --- Слепок аудитории (только ID, анонимно) ---
+        # --- Слепок аудитории (только псевдонимные ID) ---
         # Доступно владельцу/админу канала. Обёрнуто в try/except:
         # если Telegram не отдаст список - скрипт продолжит работу без Динамики.
-        subscriber_ids = []
-        try:
-            async for u in tg.iter_participants(ch):
-                subscriber_ids.append(u.id)
+        subscriber_ids = await collect_subscriber_ids(tg, ch, subs)
+        if subscriber_ids is not None:
             print(f"Слепок аудитории: {len(subscriber_ids)} ID")
-        except Exception as e:
-            print(f"⚠️ Не удалось получить список подписчиков: {e}")
 
         # --- Запись в Google Sheets ---
         # time.sleep(3) между листами - защита от лимита Google
         # на количество запросов в минуту.
-        book=get_book()
+        book=get_book(settings)
 
         write_channel(get_or_create(book,"Канал"),book,ch,subs,desc)
         print("✅ Канал"); time.sleep(3)
 
-        write_posts(get_or_create(book,"Посты"),book,posts,subs)
+        all_posts = write_posts(
+            get_or_create(book, "Посты"), book, posts, subs, settings.channel)
         print("✅ Посты"); time.sleep(3)
 
-        write_dashboard(get_or_create(book,"Дашборд"),book,posts,subs)
+        write_dashboard(get_or_create(book,"Дашборд"),book,all_posts,subs)
         print("✅ Дашборд"); time.sleep(3)
 
-        if subscriber_ids:
+        if subscriber_ids is not None:
             write_dynamics(book, subscriber_ids, subs)
             print("✅ Динамика")
 
-        print(f"\n📊 https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}")
+        print("\n📊 Данные успешно обновлены")
 
 if __name__=="__main__":
     asyncio.run(main())

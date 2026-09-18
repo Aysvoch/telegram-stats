@@ -1,0 +1,5 @@
+telethon==1.45.0
+gspread==6.2.1
+gspread-formatting==1.2.1
+google-auth==2.58.0
+python-dotenv==1.2.3
