@@ -213,6 +213,43 @@ def slice_post(post_id, date, views, *, views_24=None, views_72=None,
 
 
 class SliceLogicTests(unittest.TestCase):
+    def test_slice_header_tolerates_spacing_differences(self):
+        header = [f"  {value.replace(' ', '  ')}  "
+                  for value in stats.SLICE_HEADER]
+        self.assertTrue(stats._slice_header_matches([header]))
+
+    def test_conflicting_slice_sheet_is_renamed_not_deleted(self):
+        class Worksheet:
+            def __init__(self, title):
+                self.title = title
+
+            def update_title(self, title):
+                self.title = title
+
+        class Book:
+            def __init__(self, worksheet):
+                self.old = worksheet
+                self.new = Worksheet("new")
+                self.added = None
+
+            def worksheets(self):
+                return [self.old]
+
+            def add_worksheet(self, **kwargs):
+                self.added = kwargs
+                self.new.title = kwargs["title"]
+                return self.new
+
+        old = Worksheet("Срезы")
+        book = Book(old)
+        replacement = stats._replace_conflicting_slice_sheet(
+            old, book,
+            now=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+
+        self.assertEqual(old.title, "Срезы — резерв 20260102-030405")
+        self.assertEqual(replacement.title, "Срезы")
+        self.assertEqual(book.added, {"title": "Срезы", "rows": 500, "cols": 20})
+
     def test_live_and_legacy_slices_have_honest_metadata(self):
         now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
         posts = [

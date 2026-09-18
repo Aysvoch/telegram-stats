@@ -820,13 +820,44 @@ def _slice_cell(value):
     return {"userEnteredValue": {"stringValue": str(value)}}
 
 
+def _normalized_header(values):
+    return [
+        " ".join(str(value).replace("\u00a0", " ").split()).casefold()
+        for value in values
+    ]
+
+
+def _slice_header_matches(values):
+    if not values or len(values[0]) < len(SLICE_HEADER):
+        return False
+    return (_normalized_header(values[0][:len(SLICE_HEADER)]) ==
+            _normalized_header(SLICE_HEADER))
+
+
+def _replace_conflicting_slice_sheet(ws, book, now=None):
+    """Сохраняет конфликтующий лист под резервным именем и создаёт чистый."""
+    now = now or datetime.now(timezone.utc)
+    base = f"Срезы — резерв {now.strftime('%Y%m%d-%H%M%S')}"
+    titles = {worksheet.title for worksheet in book.worksheets()}
+    backup_title = base
+    suffix = 2
+    while backup_title in titles:
+        backup_title = f"{base} ({suffix})"
+        suffix += 1
+
+    ws.update_title(backup_title)
+    print(
+        "⚠️ Существующий лист 'Срезы' имел другую структуру и сохранён как "
+        f"'{backup_title}'. Создан новый лист без потери старых данных.")
+    return book.add_worksheet(title="Срезы", rows=500, cols=20)
+
+
 def write_slices(ws, book, posts, subscribers, now=None):
     """Создаёт и дополняет нормализованный лист контрольных срезов."""
     existing_values = ws.get_all_values()
-    if existing_values and existing_values[0][:len(SLICE_HEADER)] != SLICE_HEADER:
-        raise RuntimeError(
-            "Лист 'Срезы' уже существует, но его шапка не распознана. "
-            "Запись остановлена, чтобы не повредить данные.")
+    if existing_values and not _slice_header_matches(existing_values):
+        ws = _replace_conflicting_slice_sheet(ws, book, now=now)
+        existing_values = []
 
     if not existing_values:
         ws.update(values=[SLICE_HEADER], range_name="A1", value_input_option="RAW")
