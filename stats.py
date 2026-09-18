@@ -11,6 +11,7 @@
 #  Листы таблицы:
 #   Канал      - паспорт канала
 #   Посты      - метрики по каждому посту (+ автозаполнение 24ч/72ч)
+#   Срезы      - контрольные точки 6/24/72/168ч и темп набора просмотров
 #   Дашборд    - KPI, топ-5, динамика по неделям
 #   Динамика   - история подписчиков (append-only, никогда не стирается)
 #   _Аудитория - служебный скрытый лист со слепком ID подписчиков
@@ -155,8 +156,9 @@ def get_book(settings):
     Без него один временный сбой на стороне Google ронял весь прогон.
     """
     import json
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
+    # Таблица открывается напрямую по SPREADSHEET_ID, поэтому общий доступ ко
+    # всему Google Drive не нужен. Ограничиваем сервисный аккаунт Sheets API.
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds_env = os.getenv("GOOGLE_CREDENTIALS")
     if creds_env:
         creds = Credentials.from_service_account_info(
@@ -244,6 +246,17 @@ def note_req(ws, a1, text):
         "range": r,
         "rows": [{"values": [{"note": text}]}],
         "fields": "note"}}
+
+
+def number_format_req(ws, a1, pattern="0.0"):
+    """Запрос: числовой формат без изменения заливки и шрифта."""
+    return {"repeatCell": {
+        "range": gspread.utils.a1_range_to_grid_range(a1, ws.id),
+        "cell": {"userEnteredFormat": {"numberFormat": {
+            "type": "NUMBER", "pattern": pattern,
+        }}},
+        "fields": "userEnteredFormat.numberFormat",
+    }}
 
 def fmt_reactions(d):
     """Словарь реакций {эмодзи: число} -> строка 'эмодзи N  эмодзи N'."""
@@ -363,7 +376,7 @@ def _existing_posts(values):
     return result
 
 
-def _analytics_post(row):
+def _analytics_post(row, captured_targets=None, is_fresh=False):
     reactions = as_number(row[7])
     forwards = as_number(row[13])
     replies = as_number(row[14])
@@ -371,11 +384,17 @@ def _analytics_post(row):
     return {
         "id": int(row[0]),
         "date": row[1],
+        "url": row[2],
         "text_preview": row[3],
         "views": views,
+        "views_24": as_number(row[5], default=None),
+        "views_72": as_number(row[6], default=None),
         "forwards": forwards,
         "replies": replies,
         "reactions_total": reactions,
+        "subscribers_at_post": as_number(row[9], default=None),
+        "captured_targets": set(captured_targets or ()),
+        "is_fresh": is_fresh,
         "err": engagement_rate(reactions, forwards, replies, views),
     }
 
@@ -475,12 +494,14 @@ def build_post_rows(existing_values, posts, subscribers, channel, now=None):
 
     now = now or datetime.now(timezone.utc)
     rows_by_id = {}
+    captured_targets = {}
 
     for post_id in sorted(set(existing) | set(fresh), reverse=True):
         old = existing.get(post_id, [""] * 16)
         if post_id not in fresh:
             old[10] = old[11] = old[15] = ""  # формулы восстановятся ниже
             rows_by_id[post_id] = old
+            captured_targets[post_id] = set()
             continue
 
         post = fresh[post_id]
@@ -491,10 +512,12 @@ def build_post_rows(existing_values, posts, subscribers, channel, now=None):
         views_24h = old[5]
         if views_24h in (None, "") and 24 <= age_h < 48:
             views_24h = post["views"]
+            captured_targets.setdefault(post_id, set()).add(24)
 
         views_72h = old[6]
         if views_72h in (None, "") and 72 <= age_h < 96:
             views_72h = post["views"]
+            captured_targets.setdefault(post_id, set()).add(72)
 
         # Историческое число подписчиков нельзя восстановить задним числом.
         # Для впервые увиденного старого поста оставляем пусто, а не подставляем
@@ -510,15 +533,24 @@ def build_post_rows(existing_values, posts, subscribers, channel, now=None):
             subs_at_post, "", "", old[12],
             post["forwards"], post["replies"], "",
         ]
+        captured_targets.setdefault(post_id, set())
 
     data_rows = [rows_by_id[post_id] for post_id in sorted(rows_by_id, reverse=True)]
-    return [POST_HEADER, *data_rows], [_analytics_post(row) for row in data_rows]
+    analytics_posts = [
+        _analytics_post(
+            row,
+            captured_targets.get(int(row[0])),
+            is_fresh=int(row[0]) in fresh,
+        )
+        for row in data_rows
+    ]
+    return [POST_HEADER, *data_rows], analytics_posts
 
 
-def write_posts(ws, book, posts, subscribers, channel):
+def write_posts(ws, book, posts, subscribers, channel, now=None):
     existing_values = ws.get_all_values()
     rows, analytics_posts = build_post_rows(
-        existing_values, posts, subscribers, channel)
+        existing_values, posts, subscribers, channel, now=now)
 
     required_rows = max(len(rows) + 20, 500)
     if ws.row_count < required_rows or ws.col_count < 20:
@@ -588,6 +620,283 @@ def write_posts(ws, book, posts, subscribers, channel):
     push(book, reqs)
     set_frozen(ws, rows=1)
     return analytics_posts
+
+# ============================================================
+#  ЛИСТ «СРЕЗЫ» — контрольные точки жизни поста
+# ============================================================
+
+SHEETS_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
+SHEETS_DATE_PATTERN = "yyyy-mm-dd hh:mm"
+
+SLICE_HEADER = [
+    "ID поста", "Дата поста (UTC)", "Ссылка", "Цель, ч",
+    "Факт. возраст, ч", "Снято (UTC)", "Просмотры",
+    "Прирост просмотров", "Прирост %", "Просмотров/час",
+    "Реакции", "Пересылки", "Комментарии", "ERR %",
+    "Подписчики при публикации", "Подписчики при срезе",
+    "Reach %", "Источник",
+]
+
+# Правая граница не включается. Окна дают несколько попыток при расписании
+# раз в 6 часов, но не позволяют выдавать очень поздний замер за ранний срез.
+SLICE_WINDOWS = {6: 18, 24: 48, 72: 96, 168: 192}
+
+
+def sheets_datetime_serial(value):
+    """UTC datetime -> серийное число даты Google Sheets/Excel."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (value.astimezone(timezone.utc) - SHEETS_EPOCH).total_seconds() / 86400
+
+
+def sheets_datetime_cell(value):
+    """Ячейка даты, которую Google хранит числом, а не текстом."""
+    return {
+        "userEnteredValue": {"numberValue": sheets_datetime_serial(value)},
+        "userEnteredFormat": {"numberFormat": {
+            "type": "DATE_TIME",
+            "pattern": SHEETS_DATE_PATTERN,
+        }},
+    }
+
+
+def _slice_existing(values):
+    """Индекс уже записанных срезов по паре (ID поста, целевой час)."""
+    result = {}
+    for row_number, row in enumerate(values[1:], start=2):
+        if len(row) < 7:
+            raise RuntimeError(
+                f"Лист 'Срезы': неполная строка {row_number}.")
+        post_id = as_number(row[0], default=None)
+        target = as_number(row[3], default=None)
+        views = as_number(row[6], default=None)
+        if post_id is None or target is None or views is None:
+            raise RuntimeError(
+                f"Лист 'Срезы': не распознаны ID, цель или просмотры "
+                f"в строке {row_number}.")
+        key = (int(post_id), int(target))
+        if key in result:
+            raise RuntimeError(
+                f"Лист 'Срезы': повтор ключа {key} в строке {row_number}.")
+        result[key] = {
+            "views": views,
+            "actual_age": as_number(row[4], default=None),
+        }
+    return result
+
+
+def _live_slice(post, target, age_h, subscribers, captured_at):
+    return {
+        "post_id": post["id"],
+        "post_date": datetime.strptime(
+            post["date"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc),
+        "url": post["url"],
+        "target": target,
+        "actual_age": round_half_up(age_h, 1),
+        "captured_at": captured_at,
+        "views": post["views"],
+        "reactions": post["reactions_total"],
+        "forwards": post["forwards"],
+        "replies": post["replies"],
+        "subscribers_at_post": post["subscribers_at_post"],
+        "subscribers_at_slice": subscribers,
+        "source": "live",
+    }
+
+
+def _legacy_slice(post, target, views):
+    """Старый срез без придумывания неизвестных времени и реакций."""
+    return {
+        "post_id": post["id"],
+        "post_date": datetime.strptime(
+            post["date"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc),
+        "url": post["url"],
+        "target": target,
+        "actual_age": None,
+        "captured_at": None,
+        "views": views,
+        "reactions": None,
+        "forwards": None,
+        "replies": None,
+        "subscribers_at_post": post["subscribers_at_post"],
+        "subscribers_at_slice": None,
+        "source": "legacy_posts",
+    }
+
+
+def build_slice_rows(existing_values, posts, subscribers, now=None):
+    """Готовит только отсутствующие контрольные точки, не создавая дублей."""
+    now = (now or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
+    existing = _slice_existing(existing_values)
+    candidates = []
+
+    for post in posts:
+        post_dt = datetime.strptime(
+            post["date"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        age_h = (now - post_dt).total_seconds() / 3600
+        if age_h < 0:
+            continue
+
+        for target, window_end in SLICE_WINDOWS.items():
+            key = (post["id"], target)
+            if key in existing:
+                continue
+
+            historical_views = (
+                post.get("views_24") if target == 24 else
+                post.get("views_72") if target == 72 else None
+            )
+            captured_now = target in post.get("captured_targets", set())
+
+            if captured_now:
+                candidates.append(
+                    _live_slice(post, target, age_h, subscribers, now))
+            elif historical_views is not None:
+                candidates.append(
+                    _legacy_slice(post, target, historical_views))
+            elif (post.get("is_fresh") and target <= age_h < window_end
+                  and target not in (24, 72)):
+                candidates.append(
+                    _live_slice(post, target, age_h, subscribers, now))
+
+    rows = []
+    source_counts = defaultdict(int)
+    # Сначала меньшие цели одного поста: тогда 72ч сразу видит срез 24ч,
+    # даже если оба исторических значения переносятся в одном запуске.
+    for snapshot in sorted(
+            candidates, key=lambda item: (item["post_id"], item["target"])):
+        post_id = snapshot["post_id"]
+        previous_targets = [
+            target for (known_id, target) in existing
+            if known_id == post_id and target < snapshot["target"]
+        ]
+        previous = (existing[(post_id, max(previous_targets))]
+                    if previous_targets else None)
+
+        views = snapshot["views"]
+        growth = None
+        growth_pct = None
+        if previous is not None:
+            growth = views - previous["views"]
+            if previous["views"]:
+                growth_pct = round_half_up(
+                    growth / previous["views"] * 100, 1)
+
+        actual_age = snapshot["actual_age"]
+        views_per_hour = (round_half_up(views / actual_age, 1)
+                          if actual_age else None)
+        reactions = snapshot["reactions"]
+        err = (engagement_rate(
+            reactions, snapshot["forwards"], snapshot["replies"], views)
+            if reactions is not None else None)
+        subscribers_at_post = snapshot["subscribers_at_post"]
+        reach = (round_half_up(views / subscribers_at_post * 100, 1)
+                 if subscribers_at_post else None)
+
+        rows.append([
+            post_id, snapshot["post_date"], snapshot["url"],
+            snapshot["target"], actual_age, snapshot["captured_at"], views,
+            growth, growth_pct, views_per_hour, reactions,
+            snapshot["forwards"], snapshot["replies"], err,
+            subscribers_at_post, snapshot["subscribers_at_slice"], reach,
+            snapshot["source"],
+        ])
+        existing[(post_id, snapshot["target"])] = {
+            "views": views,
+            "actual_age": actual_age,
+        }
+        source_counts[snapshot["source"]] += 1
+
+    return rows, dict(source_counts)
+
+
+def _slice_cell(value):
+    if isinstance(value, datetime):
+        return sheets_datetime_cell(value)
+    if value is None or value == "":
+        return {"userEnteredValue": {"stringValue": ""}}
+    if isinstance(value, (int, float)):
+        return {"userEnteredValue": {"numberValue": value}}
+    return {"userEnteredValue": {"stringValue": str(value)}}
+
+
+def write_slices(ws, book, posts, subscribers, now=None):
+    """Создаёт и дополняет нормализованный лист контрольных срезов."""
+    existing_values = ws.get_all_values()
+    if existing_values and existing_values[0][:len(SLICE_HEADER)] != SLICE_HEADER:
+        raise RuntimeError(
+            "Лист 'Срезы' уже существует, но его шапка не распознана. "
+            "Запись остановлена, чтобы не повредить данные.")
+
+    if not existing_values:
+        ws.update(values=[SLICE_HEADER], range_name="A1", value_input_option="RAW")
+        existing_values = [SLICE_HEADER]
+        set_column_widths(ws, [
+            ("A", 75), ("B", 145), ("C", 180), ("D", 75), ("E", 110),
+            ("F", 145), ("G", 95), ("H", 125), ("I", 95), ("J", 115),
+            ("K", 90), ("L", 90), ("M", 100), ("N", 80), ("O", 145),
+            ("P", 135), ("Q", 85), ("R", 115),
+        ])
+        set_row_height(ws, "1", 34)
+        reqs = [
+            fmt(ws, "A1:R1", FMT_H),
+            note_req(ws, "D1", "Контрольная точка: 6, 24, 72 или 168 часов."),
+            note_req(ws, "E1", "Реальный возраст поста при замере; у перенесённых исторических срезов неизвестен."),
+            note_req(ws, "F1", "Точное время живого замера; у исторических значений остаётся пустым."),
+            note_req(ws, "H1", "Разница с ближайшим предыдущим срезом этого поста."),
+            note_req(ws, "J1", "Средняя скорость: просмотры / фактический возраст поста."),
+            note_req(ws, "N1", "Взаимодействия / просмотры на момент живого замера."),
+            note_req(ws, "Q1", "Просмотры / подписчики при публикации."),
+            note_req(ws, "R1", "live — точный новый замер; legacy_posts — перенос старых 24/72ч без выдуманного времени."),
+        ]
+        try:
+            reqs.append({"addBanding": {"bandedRange": {
+                "range": {"sheetId": ws.id, "startRowIndex": 1,
+                          "endRowIndex": ws.row_count,
+                          "startColumnIndex": 0, "endColumnIndex": 18},
+                "rowProperties": {
+                    "firstBandColor": {
+                        "red": 0.878, "green": 0.961, "blue": 0.961},
+                    "secondBandColor": {
+                        "red": 0.918, "green": 0.945, "blue": 0.980},
+                },
+            }}})
+            push(book, reqs)
+        except Exception:
+            push(book, reqs[:-1])
+        set_frozen(ws, rows=1)
+
+    rows, source_counts = build_slice_rows(
+        existing_values, posts, subscribers, now=now)
+    if not rows:
+        return {"added": 0, "live": 0, "legacy": 0}
+
+    required_rows = len(existing_values) + len(rows) + 20
+    if ws.row_count < required_rows or ws.col_count < len(SLICE_HEADER):
+        ws.resize(rows=max(ws.row_count, required_rows),
+                  cols=max(ws.col_count, len(SLICE_HEADER)))
+
+    book.batch_update({"requests": [{
+        "appendCells": {
+            "sheetId": ws.id,
+            "rows": [{"values": [_slice_cell(value) for value in row]}
+                     for row in rows],
+            "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+        }
+    }]})
+    last_row = len(existing_values) + len(rows)
+    push(book, [
+        border(ws, f"A1:R{last_row}"),
+        number_format_req(ws, f"E2:E{last_row}"),
+        number_format_req(ws, f"I2:J{last_row}"),
+        number_format_req(ws, f"N2:N{last_row}"),
+        number_format_req(ws, f"Q2:Q{last_row}"),
+    ])
+    return {
+        "added": len(rows),
+        "live": source_counts.get("live", 0),
+        "legacy": source_counts.get("legacy_posts", 0),
+    }
 
 # ============================================================
 #  ЛИСТ «ДАШБОРД»
@@ -680,28 +989,6 @@ def write_dashboard(ws, book, posts, subs):
 #  ЛИСТ «ДИНАМИКА» + служебный слепок аудитории
 # ============================================================
 
-SHEETS_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
-DYNAMICS_DATE_PATTERN = "yyyy-mm-dd hh:mm"
-
-
-def sheets_datetime_serial(value):
-    """UTC datetime -> серийное число даты Google Sheets/Excel."""
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return (value.astimezone(timezone.utc) - SHEETS_EPOCH).total_seconds() / 86400
-
-
-def dynamics_date_cell(value):
-    """Ячейка даты, которую Google хранит числом, а не текстом."""
-    return {
-        "userEnteredValue": {"numberValue": sheets_datetime_serial(value)},
-        "userEnteredFormat": {"numberFormat": {
-            "type": "DATE_TIME",
-            "pattern": DYNAMICS_DATE_PATTERN,
-        }},
-    }
-
-
 def dynamics_date_repair_requests(ws):
     """Одноразово преобразует даты, записанные прежней версией как текст."""
     values = ws.get("A2:A", value_render_option="UNFORMATTED_VALUE")
@@ -722,7 +1009,7 @@ def dynamics_date_repair_requests(ws):
                 # offset=0 соответствует строке 2, то есть rowIndex=1.
                 "start": {"sheetId": ws.id, "rowIndex": offset + 1,
                           "columnIndex": 0},
-                "rows": [{"values": [dynamics_date_cell(parsed)]}],
+                "rows": [{"values": [sheets_datetime_cell(parsed)]}],
                 "fields": "userEnteredValue,userEnteredFormat.numberFormat",
             }
         })
@@ -831,7 +1118,7 @@ def write_dynamics(book, current_ids, subs):
             "appendCells": {
                 "sheetId": dyn.id,
                 "rows": [{"values": [
-                    dynamics_date_cell(captured_at_dt),
+                    sheets_datetime_cell(captured_at_dt),
                     {"userEnteredValue": entered(subs)},
                     {"userEnteredValue": entered(joined)},
                     {"userEnteredValue": entered(left)},
@@ -942,6 +1229,7 @@ async def main(settings=None):
         subscriber_ids = await collect_subscriber_ids(tg, ch, subs)
         if subscriber_ids is not None:
             print(f"Слепок аудитории: {len(subscriber_ids)} ID")
+        run_at = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
         # --- Запись в Google Sheets ---
         # time.sleep(3) между листами - защита от лимита Google
@@ -952,8 +1240,18 @@ async def main(settings=None):
         print("✅ Канал"); time.sleep(3)
 
         all_posts = write_posts(
-            get_or_create(book, "Посты"), book, posts, subs, settings.channel)
+            get_or_create(book, "Посты"), book, posts, subs,
+            settings.channel, now=run_at)
         print("✅ Посты"); time.sleep(3)
+
+        slice_stats = write_slices(
+            get_or_create(book, "Срезы"), book, all_posts, subs, now=run_at)
+        print(
+            "✅ Срезы: "
+            f"добавлено {slice_stats['added']} "
+            f"(новых {slice_stats['live']}, "
+            f"исторических {slice_stats['legacy']})")
+        time.sleep(3)
 
         write_dashboard(get_or_create(book,"Дашборд"),book,all_posts,subs)
         print("✅ Дашборд"); time.sleep(3)

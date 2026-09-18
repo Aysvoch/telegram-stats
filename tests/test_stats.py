@@ -1,7 +1,7 @@
 import os
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import stats
 
@@ -49,6 +49,32 @@ class StatisticsLogicTests(unittest.TestCase):
         load_dotenv_mock.assert_called_once_with()
         self.assertEqual(settings.api_id, 123)
         self.assertIsNone(settings.post_fetch_limit)
+
+    def test_google_auth_uses_only_sheets_scope(self):
+        settings = stats.Settings(
+            api_id=1,
+            api_hash="hash",
+            channel="channel",
+            spreadsheet_id="sheet-id",
+            service_account_file=None,
+            post_fetch_limit=None,
+        )
+        fake_client = Mock()
+        fake_client.open_by_key.return_value = "book"
+        with patch.dict(
+                os.environ, {"GOOGLE_CREDENTIALS": "{}"}, clear=True):
+            with patch.object(
+                    stats.Credentials, "from_service_account_info",
+                    return_value="credentials") as credentials_mock:
+                with patch.object(
+                        stats.gspread, "authorize",
+                        return_value=fake_client):
+                    result = stats.get_book(settings)
+
+        self.assertEqual(result, "book")
+        scopes = credentials_mock.call_args.kwargs["scopes"]
+        self.assertEqual(
+            scopes, ["https://www.googleapis.com/auth/spreadsheets"])
 
     def test_err_includes_all_interactions(self):
         self.assertEqual(stats.engagement_rate(10, 3, 2, 100), 15.0)
@@ -166,6 +192,144 @@ class SubscriberSnapshotTests(unittest.IsolatedAsyncioTestCase):
         result = await stats.collect_subscriber_ids(
             FakeTelegram([1, 2, 3]), "channel", 100)
         self.assertIsNone(result)
+
+
+def slice_post(post_id, date, views, *, views_24=None, views_72=None,
+               captured_targets=None, is_fresh=True):
+    return {
+        "id": post_id,
+        "date": date,
+        "url": f"https://t.me/channel/{post_id}",
+        "views": views,
+        "views_24": views_24,
+        "views_72": views_72,
+        "reactions_total": 3,
+        "forwards": 1,
+        "replies": 1,
+        "subscribers_at_post": 50,
+        "captured_targets": set(captured_targets or ()),
+        "is_fresh": is_fresh,
+    }
+
+
+class SliceLogicTests(unittest.TestCase):
+    def test_live_and_legacy_slices_have_honest_metadata(self):
+        now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
+        posts = [
+            slice_post(1, "2026-01-01 12:00", 130,
+                       views_24=80, views_72=100, is_fresh=False),
+            slice_post(2, "2026-01-10 02:00", 30),
+        ]
+
+        rows, counts = stats.build_slice_rows(
+            [stats.SLICE_HEADER], posts, 60, now=now)
+        by_key = {(row[0], row[3]): row for row in rows}
+
+        self.assertEqual(counts, {"legacy_posts": 2, "live": 1})
+        self.assertEqual(set(by_key), {(1, 24), (1, 72), (2, 6)})
+
+        legacy_24 = by_key[(1, 24)]
+        self.assertIsNone(legacy_24[4])
+        self.assertIsNone(legacy_24[5])
+        self.assertIsNone(legacy_24[10])
+        self.assertIsNone(legacy_24[13])
+        self.assertEqual(legacy_24[17], "legacy_posts")
+
+        legacy_72 = by_key[(1, 72)]
+        self.assertEqual(legacy_72[7], 20)
+        self.assertEqual(legacy_72[8], 25.0)
+
+        live_6 = by_key[(2, 6)]
+        self.assertEqual(live_6[4], 10.0)
+        self.assertEqual(live_6[5], now)
+        self.assertEqual(live_6[9], 3.0)
+        self.assertEqual(live_6[13], 16.7)
+        self.assertEqual(live_6[15], 60)
+        self.assertEqual(live_6[16], 60.0)
+        self.assertEqual(live_6[17], "live")
+
+    def test_slice_keys_are_idempotent(self):
+        now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
+        current = slice_post(2, "2026-01-10 02:00", 30)
+        existing = [
+            stats.SLICE_HEADER,
+            [2, "2026-01-10 02:00", "url", 6, 10, "2026-01-10 12:00",
+             30, "", "", 3, 3, 1, 1, 16.7, 50, 60, 60, "live"],
+        ]
+
+        rows, counts = stats.build_slice_rows(
+            existing, [current], 60, now=now)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(counts, {})
+
+    def test_duplicate_slice_key_stops_the_write(self):
+        duplicate = [
+            2, "2026-01-10 02:00", "url", 6, 10,
+            "2026-01-10 12:00", 30,
+        ]
+        with self.assertRaisesRegex(RuntimeError, "повтор ключа"):
+            stats.build_slice_rows(
+                [stats.SLICE_HEADER, duplicate, duplicate], [], 60)
+
+    def test_new_24_hour_value_is_recorded_as_live(self):
+        now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
+        current = slice_post(
+            3, "2026-01-09 06:00", 40, views_24=40,
+            captured_targets={24})
+
+        rows, counts = stats.build_slice_rows(
+            [stats.SLICE_HEADER], [current], 60, now=now)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], 24)
+        self.assertEqual(rows[0][4], 30.0)
+        self.assertEqual(rows[0][17], "live")
+        self.assertEqual(counts, {"live": 1})
+
+    def test_slice_dates_are_numeric_google_cells(self):
+        cell = stats.sheets_datetime_cell(
+            datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertIn("numberValue", cell["userEnteredValue"])
+        self.assertEqual(
+            cell["userEnteredFormat"]["numberFormat"]["type"],
+            "DATE_TIME")
+
+    def test_slice_writer_appends_typed_dates(self):
+        class SliceWorksheet:
+            id = 10
+            row_count = 500
+            col_count = 20
+
+            def get_all_values(self):
+                return [stats.SLICE_HEADER]
+
+            def resize(self, **_kwargs):
+                raise AssertionError("resize is not expected")
+
+        class SliceBook:
+            def __init__(self):
+                self.calls = []
+
+            def batch_update(self, body):
+                self.calls.append(body)
+
+        now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
+        book = SliceBook()
+        result = stats.write_slices(
+            SliceWorksheet(), book,
+            [slice_post(2, "2026-01-10 02:00", 30)], 60, now=now)
+
+        append = next(
+            request["appendCells"]
+            for call in book.calls for request in call["requests"]
+            if "appendCells" in request)
+        values = append["rows"][0]["values"]
+        self.assertEqual(len(values), len(stats.SLICE_HEADER))
+        self.assertIn("numberValue", values[1]["userEnteredValue"])
+        self.assertIn("numberValue", values[5]["userEnteredValue"])
+        self.assertEqual(values[17]["userEnteredValue"]["stringValue"], "live")
+        self.assertEqual(result, {"added": 1, "live": 1, "legacy": 0})
 
 
 class FakeCell:
