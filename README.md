@@ -65,6 +65,10 @@ Looker Studio   обзор канала + жизненный цикл публи
 
 Python · Telethon · gspread · Google Sheets API · GitHub Actions · Looker Studio
 
+## Документация
+
+Подробное техническое описание (архитектура, листы таблицы, метрики, типовые проблемы) - [docs/system-overview.txt](docs/system-overview.txt).
+
 ## Автор
 
 Андрей · [@Aysvoch](https://t.me/Aysvoch) · [«Приватный эфир»](https://t.me/Private_ether)
