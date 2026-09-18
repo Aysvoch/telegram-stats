@@ -65,16 +65,6 @@ Looker Studio   обзор канала + жизненный цикл публи
 
 Python · Telethon · gspread · Google Sheets API · GitHub Actions · Looker Studio
 
-## Запуск
-
-```bash
-python -m pip install -r requirements.txt
-python -m unittest discover --start-directory tests --verbose
-python stats.py
-```
-
-Для запуска нужны доступ к Telegram, ID Google Таблицы и ключ сервисного аккаунта. В GitHub Actions они передаются через Secrets.
-
 ## Автор
 
 Андрей · [@Aysvoch](https://t.me/Aysvoch) · [«Приватный эфир»](https://t.me/Private_ether)
