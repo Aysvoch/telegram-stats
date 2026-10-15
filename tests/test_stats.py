@@ -212,6 +212,80 @@ def slice_post(post_id, date, views, *, views_24=None, views_72=None,
     }
 
 
+class PaidReactionTests(unittest.TestCase):
+    def test_paid_stars_are_excluded_from_total_and_err(self):
+        class ReactionPaid:
+            pass
+
+        class ReactionEmoji:
+            def __init__(self, emoticon):
+                self.emoticon = emoticon
+
+        class Count:
+            def __init__(self, reaction, count):
+                self.reaction = reaction
+                self.count = count
+
+        message = FakeMessage(1, text="post", views=100)
+        message.reactions = Mock(results=[
+            Count(ReactionPaid(), 5), Count(ReactionEmoji("❤"), 7)])
+
+        result = stats.telegram_message_to_post(message)
+
+        self.assertEqual(result["reactions_total"], 7)
+        self.assertEqual(result["err"], 7.0)
+        self.assertIn("❤ 7", result["reactions_fmt"])
+        self.assertIn("звёзд 5", result["reactions_fmt"])
+
+
+class HourlyScheduleTests(unittest.TestCase):
+    """Частые запуски с опозданиями: каждая точка фиксируется ровно один раз,
+    на первом запуске после цели, а 24/72ч совпадают с листом «Посты»."""
+
+    def _simulate(self, run_offsets_h):
+        from datetime import timedelta
+        published = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+        post_values = [stats.POST_HEADER]
+        slice_values = [stats.SLICE_HEADER]
+        for offset in run_offsets_h:
+            now = (published + timedelta(hours=offset)).replace(
+                second=0, microsecond=0)
+            fresh = [post(1, "2026-01-01 10:00", views=int(offset * 2) + 1,
+                          reactions=1)]
+            rows, analytics = stats.build_post_rows(
+                post_values, fresh, 50, "@channel", now=now)
+            post_values = [[("" if v is None else v) for v in row]
+                           for row in rows]
+            new_slices, _ = stats.build_slice_rows(
+                slice_values, analytics, 50, now=now)
+            slice_values += [[("" if v is None else v) for v in row]
+                             for row in new_slices]
+        return post_values, slice_values[1:]
+
+    def test_each_target_is_captured_once_at_first_run_after_it(self):
+        # Ежечасно с дрейфом минут и двумя потерянными запусками (25ч и 73ч).
+        offsets = [h + 0.3 + (h % 3) * 0.2 for h in range(0, 200)
+                   if h not in (24, 73)]
+        posts, slices = self._simulate(offsets)
+
+        targets = [row[3] for row in slices]
+        self.assertEqual(sorted(targets), [6, 24, 72, 168])
+        for row in slices:
+            target, age = row[3], row[4]
+            first_run = min(o for o in offsets if o >= target)
+            self.assertAlmostEqual(age, round(first_run, 1), places=1)
+            self.assertEqual(row[17], "live")
+
+        by_target = {row[3]: row[6] for row in slices}
+        self.assertEqual(posts[1][5], by_target[24])
+        self.assertEqual(posts[1][6], by_target[72])
+
+    def test_six_hour_schedule_still_works(self):
+        offsets = [h + 0.3 for h in range(0, 200, 6)]
+        _, slices = self._simulate(offsets)
+        self.assertEqual(sorted(row[3] for row in slices), [6, 24, 72, 168])
+
+
 class SliceLogicTests(unittest.TestCase):
     def test_slice_header_tolerates_spacing_differences(self):
         header = [f"  {value.replace(' ', '  ')}  "

@@ -403,8 +403,15 @@ def telegram_message_to_post(message):
     """Преобразует одно сообщение Telegram в запись аналитики."""
     reactions_total = 0
     reactions_detail = {}
+    paid_stars = 0
     if message.reactions:
         for reaction in message.reactions.results:
+            # Платная реакция: Telegram отдаёт число звёзд, а не людей
+            # (один человек может отправить несколько). В сумму и ERR не идёт,
+            # показывается отдельно в детализации.
+            if type(reaction.reaction).__name__ == "ReactionPaid":
+                paid_stars += reaction.count
+                continue
             emoji = (reaction.reaction.emoticon
                      if hasattr(reaction.reaction, "emoticon")
                      else type(reaction.reaction).__name__)
@@ -424,7 +431,9 @@ def telegram_message_to_post(message):
         "forwards": forwards,
         "replies": replies,
         "reactions_total": reactions_total,
-        "reactions_fmt": fmt_reactions(reactions_detail),
+        "reactions_fmt": (fmt_reactions(reactions_detail) +
+                          (f"  (⭐ звёзд {paid_stars}, не в сумме)"
+                           if paid_stars else "")),
         "err": engagement_rate(
             reactions_total, forwards, replies, views),
     }
@@ -637,8 +646,10 @@ SLICE_HEADER = [
     "Reach %", "Источник",
 ]
 
-# Правая граница не включается. Окна дают несколько попыток при расписании
-# раз в 6 часов, но не позволяют выдавать очень поздний замер за ранний срез.
+# Правая граница не включается. Срез фиксируется на первом запуске после цели
+# (при ежечасном расписании - обычно в пределах часа). Окна дают запас на
+# пропущенные запуски GitHub, но не позволяют выдавать очень поздний замер
+# за ранний срез.
 SLICE_WINDOWS = {6: 18, 24: 48, 72: 96, 168: 192}
 
 
